@@ -222,6 +222,28 @@ export class User {
     return await this._redis.rpush('userinvoices_for_' + this._userid, JSON.stringify(doc));
   }
 
+  async getUsername() {
+    return await this._redis.get('username_for_' + this._userid);
+  }
+
+  async getUseridByUsername(username) {
+    return await this._redis.get('username_' + username);
+  }
+
+  async setUsername(username) {
+    const existingUserid = await this.getUseridByUsername(username);
+    if (existingUserid && existingUserid !== this._userid) return false;
+
+    const previousUsername = await this.getUsername();
+    if (previousUsername && previousUsername !== username) {
+      await this._redis.del('username_' + previousUsername);
+    }
+
+    await this._redis.set('username_for_' + this._userid, username);
+    await this._redis.set('username_' + username, this._userid);
+    return true;
+  }
+
   /**
    * Doent belong here, FIXME
    */
@@ -310,6 +332,10 @@ export class User {
         }
       } else {
         _invoice_ispaid_cache[invoice.payment_hash] = paymentHashPaidAmountSat;
+      }
+
+      if (invoice.is_tip && !invoice.ispaid) {
+        continue;
       }
 
       invoice.amt =

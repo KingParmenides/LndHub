@@ -1,10 +1,15 @@
 import { User, Lock, Paym, Invo } from '../class/';
 import fetch from 'node-fetch';
 const config = require('../config');
+const bech32 = require('bech32');
 let express = require('express');
 let router = express.Router();
 let logger = require('../utils/logger');
 const MIN_BTC_BLOCK = 670000;
+const LNURL_PAY_MIN_SENDABLE_MSAT = config.lnurlPayMinSendableMsat || 1000;
+const LNURL_PAY_MAX_SENDABLE_MSAT = config.lnurlPayMaxSendableMsat || 10000000 * 1000;
+const LNURL_PAY_COMMENT_ALLOWED = config.lnurlPayCommentAllowed || 256;
+const LNURL_PAY_USERNAME_RE = /^[a-z0-9][a-z0-9_-]{2,31}$/;
 if (process.env.NODE_ENV !== 'prod') {
   console.log('using config', JSON.stringify(config));
 }
@@ -88,6 +93,7 @@ const subscribeInvoicesCallCallback = async function (response) {
     );
     const user = new User(redis, bitcoinclient, lightning);
     user._userid = await user.getUseridByPaymentHash(LightningInvoiceSettledNotification.hash);
+    if (user._userid) LightningInvoiceSettledNotification.lndhub_userid = user._userid;
     await user.clearBalanceCache();
     console.log('payment', LightningInvoiceSettledNotification.hash, 'was paid, posting to GroundControl...');
     const baseURI = process.env.GROUNDCONTROL;
@@ -339,6 +345,110 @@ router.post('/payinvoice', postLimiter, async function (req, res) {
   });
 });
 
+router.get('/lnurlpay', postLimiter, async function (req, res) {
+  logger.log('/lnurlpay', [req.id]);
+  let u = new User(redis, bitcoinclient, lightning);
+  if (!(await u.loadByAuthorization(req.headers.authorization))) {
+    return errorBadAuth(res);
+  }
+  logger.log('/lnurlpay', [req.id, 'userid: ' + u.getUserId()]);
+
+  const username = await u.getUsername();
+  res.send(formatLnurlPayUser(req, username));
+});
+
+router.post('/lnurlpay/username', postLimiter, async function (req, res) {
+  logger.log('/lnurlpay/username', [req.id]);
+  let u = new User(redis, bitcoinclient, lightning);
+  if (!(await u.loadByAuthorization(req.headers.authorization))) {
+    return errorBadAuth(res);
+  }
+  logger.log('/lnurlpay/username', [req.id, 'userid: ' + u.getUserId()]);
+
+  const username = normalizeLnurlPayUsername(req.body.username);
+  if (!username) return errorBadArguments(res);
+
+  let lock = new Lock(redis, 'lnurlpay_username_' + username);
+  if (!(await lock.obtainLock())) {
+    return errorGeneralServerError(res);
+  }
+
+  try {
+    const saved = await u.setUsername(username);
+    await lock.releaseLock();
+    if (!saved) return errorUsernameTaken(res);
+    res.send(formatLnurlPayUser(req, username));
+  } catch (err) {
+    await lock.releaseLock();
+    return errorGeneralServerError(res);
+  }
+});
+
+router.get('/lnurlpay/:username/callback', async function (req, res) {
+  logger.log('/lnurlpay/:username/callback', [req.id, req.params.username]);
+  const username = normalizeLnurlPayUsername(req.params.username);
+  if (!username) return lnurlError(res, 'Invalid username');
+
+  const amountMsat = parseLnurlPayAmountMsat(req.query.amount);
+  if (!amountMsat) return lnurlError(res, 'Invalid amount');
+  if (amountMsat < LNURL_PAY_MIN_SENDABLE_MSAT || amountMsat > LNURL_PAY_MAX_SENDABLE_MSAT) {
+    return lnurlError(res, 'Amount is outside the allowed range');
+  }
+  if (amountMsat % 1000 !== 0) return lnurlError(res, 'Amount must be a whole satoshi');
+
+  const comment = normalizeLnurlPayComment(req.query.comment);
+  const payee = new User(redis, bitcoinclient, lightning);
+  const userid = await payee.getUseridByUsername(username);
+  if (!userid) return lnurlError(res, 'Unknown username');
+  payee._userid = userid;
+
+  if (config.sunset) return lnurlError(res, 'This LNDHub instance is scheduled to shut down');
+
+  const amountSat = amountMsat / 1000;
+  const invoice = new Invo(redis, bitcoinclient, lightning);
+  const rPreimage = invoice.makePreimageHex();
+  const memo = comment ? 'Tip for ' + username + ': ' + comment : 'Tip for ' + username;
+
+  lightning.addInvoice(
+    { memo, value: amountSat, expiry: 3600 * 24, r_preimage: Buffer.from(rPreimage, 'hex').toString('base64') },
+    async function (err, info) {
+      if (err) return lnurlError(res, 'Unable to create invoice');
+
+      info.pay_req = info.payment_request;
+      info.is_tip = true;
+      info.tip_username = username;
+      if (comment) info.tip_comment = comment;
+
+      await payee.saveUserInvoice(info);
+      await invoice.savePreimage(rPreimage);
+
+      res.send({
+        pr: info.payment_request,
+        routes: [],
+      });
+    },
+  );
+});
+
+router.get('/lnurlpay/:username', async function (req, res) {
+  logger.log('/lnurlpay/:username', [req.id, req.params.username]);
+  const username = normalizeLnurlPayUsername(req.params.username);
+  if (!username) return lnurlError(res, 'Invalid username');
+
+  const u = new User(redis, bitcoinclient, lightning);
+  const userid = await u.getUseridByUsername(username);
+  if (!userid) return lnurlError(res, 'Unknown username');
+
+  res.send({
+    tag: 'payRequest',
+    callback: lnurlPayUrl(req, username) + '/callback',
+    minSendable: LNURL_PAY_MIN_SENDABLE_MSAT,
+    maxSendable: LNURL_PAY_MAX_SENDABLE_MSAT,
+    metadata: lnurlPayMetadata(req, username),
+    commentAllowed: LNURL_PAY_COMMENT_ALLOWED,
+  });
+});
+
 router.get('/getbtc', async function (req, res) {
   logger.log('/getbtc', [req.id]);
   let u = new User(redis, bitcoinclient, lightning);
@@ -408,6 +518,15 @@ router.get('/getinfo', postLimiter, async function (req, res) {
     if (err) return errorLnd(res);
     res.send(info);
   });
+});
+
+router.get('/userid', postLimiter, async function (req, res) {
+  logger.log('/userid', [req.id]);
+  let u = new User(redis, bitcoinclient, lightning);
+  if (!(await u.loadByAuthorization(req.headers.authorization))) {
+    return errorBadAuth(res);
+  }
+  res.send({ userid: u.getUserId() });
 });
 
 router.get('/gettxs', postLimiter, async function (req, res) {
@@ -534,6 +653,63 @@ module.exports = router;
 
 // ################# HELPERS ###########################
 
+function normalizeLnurlPayUsername(username) {
+  if (!username || typeof username !== 'string') return false;
+  username = username.trim().toLowerCase();
+  if (!LNURL_PAY_USERNAME_RE.test(username)) return false;
+  return username;
+}
+
+function normalizeLnurlPayComment(comment) {
+  if (!comment || typeof comment !== 'string') return '';
+  return comment.trim().slice(0, LNURL_PAY_COMMENT_ALLOWED);
+}
+
+function parseLnurlPayAmountMsat(amount) {
+  if (!amount || !/^[0-9]+$/.test(amount)) return false;
+  const parsed = parseInt(amount);
+  if (!parsed || !Number.isSafeInteger(parsed)) return false;
+  return parsed;
+}
+
+function lnurlBaseUrl(req) {
+  if (config.baseUrl) return config.baseUrl.replace(/\/$/, '');
+  return req.protocol + '://' + req.get('host');
+}
+
+function lnurlPayUrl(req, username) {
+  return lnurlBaseUrl(req) + '/lnurlpay/' + username;
+}
+
+function encodeLnurl(url) {
+  return bech32.encode('lnurl', bech32.toWords(Buffer.from(url, 'utf8')), 1023).toUpperCase();
+}
+
+function lnurlPayMetadata(req, username) {
+  const host = config.baseUrl ? new URL(config.baseUrl).host : req.get('host');
+  return JSON.stringify([
+    ['text/plain', 'Tip ' + username + ' on LNDHub'],
+    ['text/identifier', username + '@' + host],
+  ]);
+}
+
+function formatLnurlPayUser(req, username) {
+  if (!username) return { username: false };
+  const url = lnurlPayUrl(req, username);
+  return {
+    username,
+    url,
+    lnurl: encodeLnurl(url),
+  };
+}
+
+function lnurlError(res, reason) {
+  return res.send({
+    status: 'ERROR',
+    reason,
+  });
+}
+
 function errorBadAuth(res) {
   return res.send({
     error: true,
@@ -579,6 +755,14 @@ function errorBadArguments(res) {
     error: true,
     code: 8,
     message: 'Bad arguments',
+  });
+}
+
+function errorUsernameTaken(res) {
+  return res.send({
+    error: true,
+    code: 12,
+    message: 'Username is already taken',
   });
 }
 
