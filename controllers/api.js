@@ -2,6 +2,7 @@ import { User, Lock, Paym, Invo } from '../class/';
 import fetch from 'node-fetch';
 const config = require('../config');
 const bech32 = require('bech32');
+const crypto = require('crypto');
 let express = require('express');
 let router = express.Router();
 let logger = require('../utils/logger');
@@ -143,10 +144,13 @@ const postLimiter = rateLimit({
 router.post('/create', postLimiter, async function (req, res) {
   logger.log('/create', [req.id]);
   // Valid if the partnerid isn't there or is a string (same with accounttype)
-  if (! (
-        (!req.body.partnerid || (typeof req.body.partnerid === 'string' || req.body.partnerid instanceof String))
-        && (!req.body.accounttype || (typeof req.body.accounttype === 'string' || req.body.accounttype instanceof String))
-      ) ) return errorBadArguments(res);
+  if (
+    !(
+      (!req.body.partnerid || typeof req.body.partnerid === 'string' || req.body.partnerid instanceof String) &&
+      (!req.body.accounttype || typeof req.body.accounttype === 'string' || req.body.accounttype instanceof String)
+    )
+  )
+    return errorBadArguments(res);
 
   if (config.sunset) return errorSunset(res);
 
@@ -405,17 +409,25 @@ router.get('/lnurlpay/:username/callback', async function (req, res) {
   if (config.sunset) return lnurlError(res, 'This LNDHub instance is scheduled to shut down');
 
   const amountSat = amountMsat / 1000;
+  const metadata = lnurlPayMetadata(req, username);
   const invoice = new Invo(redis, bitcoinclient, lightning);
   const rPreimage = invoice.makePreimageHex();
   const memo = comment ? 'Tip for ' + username + ': ' + comment : 'Tip for ' + username;
 
   lightning.addInvoice(
-    { memo, value: amountSat, expiry: 3600 * 24, r_preimage: Buffer.from(rPreimage, 'hex').toString('base64') },
+    {
+      value: amountSat,
+      expiry: 3600 * 24,
+      description_hash: lnurlPayMetadataHash(metadata),
+      r_preimage: Buffer.from(rPreimage, 'hex').toString('base64'),
+    },
     async function (err, info) {
       if (err) return lnurlError(res, 'Unable to create invoice');
 
       info.pay_req = info.payment_request;
       info.is_tip = true;
+      info.tip_memo = memo;
+      info.tip_metadata = metadata;
       info.tip_username = username;
       if (comment) info.tip_comment = comment;
 
@@ -691,6 +703,10 @@ function lnurlPayMetadata(req, username) {
     ['text/plain', 'Tip ' + username + ' on LNDHub'],
     ['text/identifier', username + '@' + host],
   ]);
+}
+
+function lnurlPayMetadataHash(metadata) {
+  return crypto.createHash('sha256').update(metadata).digest().toString('base64');
 }
 
 function formatLnurlPayUser(req, username) {

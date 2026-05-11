@@ -51,7 +51,7 @@ Returns LNURL-pay metadata:
 
 `GET /lnurlpay/:username/callback?amount=1000&comment=Thanks`
 
-`amount` is millisatoshis and must be a whole-satoshi amount. The callback returns:
+`amount` is millisatoshis and must be a whole-satoshi amount. The returned invoice uses the SHA-256 description hash of the LNURL metadata. The callback returns:
 
 ```json
 {

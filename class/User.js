@@ -338,6 +338,10 @@ export class User {
         continue;
       }
 
+      if (!invoice.description && invoice.is_tip && invoice.tip_memo) {
+        invoice.description = invoice.tip_memo;
+      }
+
       invoice.amt =
         paymentHashPaidAmountSat && parseInt(paymentHashPaidAmountSat) > decoded.satoshis
           ? parseInt(paymentHashPaidAmountSat)
