@@ -10,6 +10,7 @@ let logger = require('../utils/logger');
 const MIN_BTC_BLOCK = 670000;
 const LNURL_WITHDRAW_DEFAULT_EXPIRY = 3600 * 24;
 const LNURL_WITHDRAW_MAX_EXPIRY = 3600 * 24 * 30;
+const BLUEWALLET_DOWNLOAD_URL = 'https://bluewallet.io/';
 if (process.env.NODE_ENV !== 'prod') {
   console.log('using config', JSON.stringify(config));
 }
@@ -357,7 +358,7 @@ router.post('/lnurlwithdraw/create', postLimiter, async function (req, res) {
 
   if (config.sunset) return errorSunsetAddInvoice(res);
 
-  const amount = parseInt(req.body.amount);
+  const amount = parsePositiveInteger(req.body.amount);
   if (!amount || amount <= 0) return errorBadArguments(res);
 
   let lock = new Lock(redis, 'lnurlw_create_for_' + u.getUserId());
@@ -365,38 +366,41 @@ router.post('/lnurlwithdraw/create', postLimiter, async function (req, res) {
     return errorGeneralServerError(res);
   }
 
-  const requestedExpiry = parseInt(req.body.expiry);
-  const expiry = Math.min(
-    requestedExpiry && requestedExpiry > 0 ? requestedExpiry : LNURL_WITHDRAW_DEFAULT_EXPIRY,
-    LNURL_WITHDRAW_MAX_EXPIRY,
-  );
+  try {
+    const requestedExpiry = parsePositiveInteger(req.body.expiry);
+    const expiry = Math.min(requestedExpiry || LNURL_WITHDRAW_DEFAULT_EXPIRY, LNURL_WITHDRAW_MAX_EXPIRY);
 
-  const userBalance = await u.getCalculatedBalance();
-  if (userBalance < amount + Math.floor(amount * forwardFee) + 1) {
+    const userBalance = await u.getCalculatedBalance();
+    if (userBalance < amount + Math.floor(amount * forwardFee) + 1) {
+      await lock.releaseLock();
+      return errorNotEnougBalance(res);
+    }
+
+    const id = crypto.randomBytes(16).toString('hex');
+    const k1 = crypto.randomBytes(32).toString('hex');
+    const now = Math.floor(+new Date() / 1000);
+    const publicUrl = lnurlWithdrawUrl(req, id);
+    const doc = {
+      id,
+      k1,
+      userid: u.getUserId(),
+      amount,
+      memo: req.body.memo || 'LNDHub withdrawal',
+      status: 'active',
+      created_at: now,
+      expires_at: now + expiry,
+    };
+
+    await u.saveLnurlWithdrawLink(doc);
+    await u.clearBalanceCache();
     await lock.releaseLock();
-    return errorNotEnougBalance(res);
+
+    return res.send(formatLnurlWithdrawResponse(req, doc, publicUrl));
+  } catch (err) {
+    await lock.releaseLock();
+    logger.log('/lnurlwithdraw/create', [req.id, 'error:', err.message]);
+    return errorGeneralServerError(res);
   }
-
-  const id = crypto.randomBytes(16).toString('hex');
-  const k1 = crypto.randomBytes(32).toString('hex');
-  const now = Math.floor(+new Date() / 1000);
-  const publicUrl = lnurlWithdrawUrl(req, id);
-  const doc = {
-    id,
-    k1,
-    userid: u.getUserId(),
-    amount,
-    memo: req.body.memo || 'LNDHub withdrawal',
-    status: 'active',
-    created_at: now,
-    expires_at: now + expiry,
-  };
-
-  await u.saveLnurlWithdrawLink(doc);
-  await u.clearBalanceCache();
-  await lock.releaseLock();
-
-  res.send(formatLnurlWithdrawResponse(req, doc, publicUrl));
 });
 
 router.get('/lnurlwithdraw', postLimiter, async function (req, res) {
@@ -454,24 +458,30 @@ router.get('/lnurlwithdraw/:id/callback', async function (req, res) {
     }
 
     return decodeLnurlWithdrawInvoice(req.query.pr, async function (err, info) {
-      if (err) {
+      try {
+        if (err) {
+          await lock.releaseLock();
+          return lnurlError(res, 'Invalid invoice');
+        }
+
+        if (+info.num_satoshis !== +doc.amount) {
+          await lock.releaseLock();
+          return lnurlError(res, 'Invoice amount must match withdrawal amount');
+        }
+
+        const owner = new User(redis, bitcoinclient, lightning);
+        owner._userid = doc.userid;
+
+        if (identity_pubkey === info.destination) {
+          return claimInternalLnurlWithdraw(owner, doc, req.query.pr, info, lock, res);
+        }
+
+        return claimExternalLnurlWithdraw(owner, doc, req.query.pr, info, lock, res);
+      } catch (err) {
         await lock.releaseLock();
-        return lnurlError(res, 'Invalid invoice');
+        logger.log('/lnurlwithdraw/:id/callback', [req.id, 'error:', err.message]);
+        return lnurlError(res, 'Unable to claim withdrawal');
       }
-
-      if (+info.num_satoshis !== +doc.amount) {
-        await lock.releaseLock();
-        return lnurlError(res, 'Invoice amount must match withdrawal amount');
-      }
-
-      const owner = new User(redis, bitcoinclient, lightning);
-      owner._userid = doc.userid;
-
-      if (identity_pubkey === info.destination) {
-        return claimInternalLnurlWithdraw(owner, doc, req.query.pr, info, lock, res);
-      }
-
-      return claimExternalLnurlWithdraw(owner, doc, req.query.pr, info, lock, res);
     });
   } catch (err) {
     await lock.releaseLock();
@@ -492,23 +502,29 @@ router.post('/lnurlwithdraw/:id/cancel', postLimiter, async function (req, res) 
     return errorGeneralServerError(res);
   }
 
-  const doc = await u.getLnurlWithdrawLink(req.params.id);
-  if (!doc || doc.userid !== u.getUserId()) {
-    await lock.releaseLock();
-    return errorBadArguments(res);
-  }
-  if (doc.status !== 'active') {
-    await lock.releaseLock();
-    return errorBadArguments(res);
-  }
+  try {
+    const doc = await u.getLnurlWithdrawLink(req.params.id);
+    if (!doc || doc.userid !== u.getUserId()) {
+      await lock.releaseLock();
+      return errorBadArguments(res);
+    }
+    if (doc.status !== 'active') {
+      await lock.releaseLock();
+      return errorBadArguments(res);
+    }
 
-  doc.status = 'canceled';
-  doc.canceled_at = Math.floor(+new Date() / 1000);
-  await u.updateLnurlWithdrawLink(doc);
-  await u.clearBalanceCache();
-  await lock.releaseLock();
+    doc.status = 'canceled';
+    doc.canceled_at = Math.floor(+new Date() / 1000);
+    await u.updateLnurlWithdrawLink(doc);
+    await u.clearBalanceCache();
+    await lock.releaseLock();
 
-  res.send(formatLnurlWithdrawResponse(req, doc, lnurlWithdrawUrl(req, doc.id)));
+    return res.send(formatLnurlWithdrawResponse(req, doc, lnurlWithdrawUrl(req, doc.id)));
+  } catch (err) {
+    await lock.releaseLock();
+    logger.log('/lnurlwithdraw/:id/cancel', [req.id, 'error:', err.message]);
+    return errorGeneralServerError(res);
+  }
 });
 
 router.get('/getbtc', async function (req, res) {
@@ -712,6 +728,12 @@ function encodeLnurl(url) {
   return bech32.encode('lnurl', bech32.toWords(Buffer.from(url, 'utf8')), 1023).toUpperCase();
 }
 
+function parsePositiveInteger(value) {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return false;
+  return parsed;
+}
+
 function formatLnurlWithdrawResponse(req, doc, url) {
   return {
     id: doc.id,
@@ -756,7 +778,9 @@ function renderLnurlWithdrawPage(req, doc, url, error) {
       qrSvg +
       '</div><p><a class="button" href="' +
       deeplink +
-      '">Open in wallet</a></p><p class="muted">Expires ' +
+      '">Open in wallet</a></p><p class="muted"><a href="' +
+      BLUEWALLET_DOWNLOAD_URL +
+      '">Download BlueWallet</a> if you need an LNURL-compatible wallet.</p><p class="muted">Expires ' +
       expiresAt +
       '</p>';
 
@@ -840,24 +864,30 @@ async function claimExternalLnurlWithdraw(owner, doc, payReq, info, lock, res) {
   call.on('data', async function (payment) {
     if (completed) return;
     completed = true;
-    let PaymentShallow = new Paym(false, false, false);
-    payment = PaymentShallow.processSendPaymentResponse(payment);
-    payment.pay_req = payReq;
-    payment.decoded = info;
 
-    if (payment && payment.payment_route && payment.payment_route.total_amt_msat) {
-      await owner.savePaidLndInvoice(payment);
-      doc.status = 'claimed';
-      doc.claimed_at = Math.floor(+new Date() / 1000);
-      doc.claimed_payment_hash = info.payment_hash;
-      await owner.updateLnurlWithdrawLink(doc);
-      await owner.clearBalanceCache();
+    try {
+      if (payment && payment.payment_route && payment.payment_route.total_amt_msat) {
+        let PaymentShallow = new Paym(false, false, false);
+        payment = PaymentShallow.processSendPaymentResponse(payment);
+        payment.pay_req = payReq;
+        payment.decoded = info;
+        await owner.savePaidLndInvoice(payment);
+        doc.status = 'claimed';
+        doc.claimed_at = Math.floor(+new Date() / 1000);
+        doc.claimed_payment_hash = info.payment_hash;
+        await owner.updateLnurlWithdrawLink(doc);
+        await owner.clearBalanceCache();
+        await lock.releaseLock();
+        return res.send({ status: 'OK' });
+      }
+
       await lock.releaseLock();
-      return res.send({ status: 'OK' });
+      return lnurlError(res, 'Payment failed');
+    } catch (err) {
+      await lock.releaseLock();
+      logger.log('/lnurlwithdraw/:id/callback', ['error:', err.message]);
+      return lnurlError(res, 'Unable to claim withdrawal');
     }
-
-    await lock.releaseLock();
-    return lnurlError(res, 'Payment failed');
   });
 
   call.on('error', async function () {
@@ -867,11 +897,18 @@ async function claimExternalLnurlWithdraw(owner, doc, payReq, info, lock, res) {
     return lnurlError(res, 'Payment failed');
   });
 
-  call.write({
-    payment_request: payReq,
-    amt: info.num_satoshis,
-    fee_limit: { fixed: Math.floor(info.num_satoshis * forwardFee) + 1 },
-  });
+  try {
+    call.write({
+      payment_request: payReq,
+      amt: info.num_satoshis,
+      fee_limit: { fixed: Math.floor(info.num_satoshis * forwardFee) + 1 },
+    });
+  } catch (err) {
+    if (completed) return;
+    completed = true;
+    await lock.releaseLock();
+    return lnurlError(res, 'Payment failed');
+  }
 }
 
 module.exports = router;

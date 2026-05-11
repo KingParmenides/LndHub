@@ -37,7 +37,7 @@ Response:
 }
 ```
 
-The link URL also renders a simple browser page with a QR code and wallet deep link. LNURL wallets receive the standard `withdrawRequest` JSON from the same URL.
+The link URL also renders a simple browser page with a QR code, wallet deep link, and BlueWallet download link. LNURL wallets receive the standard `withdrawRequest` JSON from the same URL.
 
 ## List Links
 
