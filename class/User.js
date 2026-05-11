@@ -184,6 +184,11 @@ export class User {
       calculatedBalance -= +paym.amount + /* feelimit */ Math.floor(paym.amount * forwardFee);
     }
 
+    let withdrawLinks = await this.getActiveLnurlWithdrawLinks();
+    for (let withdrawLink of withdrawLinks) {
+      calculatedBalance -= +withdrawLink.amount + /* feelimit */ Math.floor(withdrawLink.amount * forwardFee);
+    }
+
     return calculatedBalance;
   }
 
@@ -589,6 +594,48 @@ export class User {
     }
 
     return result;
+  }
+
+  async saveLnurlWithdrawLink(doc) {
+    await this._redis.set('lnurlw_' + doc.id, JSON.stringify(doc));
+    await this._redis.set('lnurlw_id_for_k1_' + doc.k1, doc.id);
+    return this._redis.rpush('lnurlw_for_' + this._userid, doc.id);
+  }
+
+  async getLnurlWithdrawLink(id) {
+    let doc = await this._redis.get('lnurlw_' + id);
+    if (!doc) return false;
+
+    try {
+      return JSON.parse(doc);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async getLnurlWithdrawLinkByK1(k1) {
+    const id = await this._redis.get('lnurlw_id_for_k1_' + k1);
+    if (!id) return false;
+    return this.getLnurlWithdrawLink(id);
+  }
+
+  async updateLnurlWithdrawLink(doc) {
+    return this._redis.set('lnurlw_' + doc.id, JSON.stringify(doc));
+  }
+
+  async getUserLnurlWithdrawLinks() {
+    let ids = await this._redis.lrange('lnurlw_for_' + this._userid, 0, -1);
+    let result = [];
+    for (let id of ids) {
+      let doc = await this.getLnurlWithdrawLink(id);
+      if (doc) result.push(doc);
+    }
+    return result;
+  }
+
+  async getActiveLnurlWithdrawLinks() {
+    const now = Math.floor(+new Date() / 1000);
+    return (await this.getUserLnurlWithdrawLinks()).filter((doc) => doc.status === 'active' && doc.expires_at > now);
   }
 
   async getOrGenerateAddress() {

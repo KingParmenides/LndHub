@@ -1,10 +1,15 @@
 import { User, Lock, Paym, Invo } from '../class/';
 import fetch from 'node-fetch';
 const config = require('../config');
+const crypto = require('crypto');
+const bech32 = require('bech32');
+const qr = require('qr-image');
 let express = require('express');
 let router = express.Router();
 let logger = require('../utils/logger');
 const MIN_BTC_BLOCK = 670000;
+const LNURL_WITHDRAW_DEFAULT_EXPIRY = 3600 * 24;
+const LNURL_WITHDRAW_MAX_EXPIRY = 3600 * 24 * 30;
 if (process.env.NODE_ENV !== 'prod') {
   console.log('using config', JSON.stringify(config));
 }
@@ -137,10 +142,13 @@ const postLimiter = rateLimit({
 router.post('/create', postLimiter, async function (req, res) {
   logger.log('/create', [req.id]);
   // Valid if the partnerid isn't there or is a string (same with accounttype)
-  if (! (
-        (!req.body.partnerid || (typeof req.body.partnerid === 'string' || req.body.partnerid instanceof String))
-        && (!req.body.accounttype || (typeof req.body.accounttype === 'string' || req.body.accounttype instanceof String))
-      ) ) return errorBadArguments(res);
+  if (
+    !(
+      (!req.body.partnerid || typeof req.body.partnerid === 'string' || req.body.partnerid instanceof String) &&
+      (!req.body.accounttype || typeof req.body.accounttype === 'string' || req.body.accounttype instanceof String)
+    )
+  )
+    return errorBadArguments(res);
 
   if (config.sunset) return errorSunset(res);
 
@@ -339,6 +347,170 @@ router.post('/payinvoice', postLimiter, async function (req, res) {
   });
 });
 
+router.post('/lnurlwithdraw/create', postLimiter, async function (req, res) {
+  logger.log('/lnurlwithdraw/create', [req.id]);
+  let u = new User(redis, bitcoinclient, lightning);
+  if (!(await u.loadByAuthorization(req.headers.authorization))) {
+    return errorBadAuth(res);
+  }
+  logger.log('/lnurlwithdraw/create', [req.id, 'userid: ' + u.getUserId()]);
+
+  if (config.sunset) return errorSunsetAddInvoice(res);
+
+  const amount = parseInt(req.body.amount);
+  if (!amount || amount <= 0) return errorBadArguments(res);
+
+  let lock = new Lock(redis, 'lnurlw_create_for_' + u.getUserId());
+  if (!(await lock.obtainLock())) {
+    return errorGeneralServerError(res);
+  }
+
+  const requestedExpiry = parseInt(req.body.expiry);
+  const expiry = Math.min(
+    requestedExpiry && requestedExpiry > 0 ? requestedExpiry : LNURL_WITHDRAW_DEFAULT_EXPIRY,
+    LNURL_WITHDRAW_MAX_EXPIRY,
+  );
+
+  const userBalance = await u.getCalculatedBalance();
+  if (userBalance < amount + Math.floor(amount * forwardFee) + 1) {
+    await lock.releaseLock();
+    return errorNotEnougBalance(res);
+  }
+
+  const id = crypto.randomBytes(16).toString('hex');
+  const k1 = crypto.randomBytes(32).toString('hex');
+  const now = Math.floor(+new Date() / 1000);
+  const publicUrl = lnurlWithdrawUrl(req, id);
+  const doc = {
+    id,
+    k1,
+    userid: u.getUserId(),
+    amount,
+    memo: req.body.memo || 'LNDHub withdrawal',
+    status: 'active',
+    created_at: now,
+    expires_at: now + expiry,
+  };
+
+  await u.saveLnurlWithdrawLink(doc);
+  await u.clearBalanceCache();
+  await lock.releaseLock();
+
+  res.send(formatLnurlWithdrawResponse(req, doc, publicUrl));
+});
+
+router.get('/lnurlwithdraw', postLimiter, async function (req, res) {
+  logger.log('/lnurlwithdraw', [req.id]);
+  let u = new User(redis, bitcoinclient, lightning);
+  if (!(await u.loadByAuthorization(req.headers.authorization))) {
+    return errorBadAuth(res);
+  }
+
+  const links = await u.getUserLnurlWithdrawLinks();
+  res.send(links.map((doc) => formatLnurlWithdrawResponse(req, doc, lnurlWithdrawUrl(req, doc.id))));
+});
+
+router.get('/lnurlwithdraw/:id', async function (req, res) {
+  logger.log('/lnurlwithdraw/:id', [req.id, req.params.id]);
+  const doc = await getLnurlWithdrawLink(req.params.id);
+  const validationError = validateLnurlWithdrawLink(doc);
+  const publicUrl = lnurlWithdrawUrl(req, req.params.id);
+
+  if (wantsHtml(req)) {
+    return res.status(validationError ? 410 : 200).send(renderLnurlWithdrawPage(req, doc, publicUrl, validationError));
+  }
+
+  if (validationError) return lnurlError(res, validationError);
+
+  res.send({
+    tag: 'withdrawRequest',
+    callback: publicUrl + '/callback',
+    k1: doc.k1,
+    defaultDescription: doc.memo,
+    minWithdrawable: doc.amount * 1000,
+    maxWithdrawable: doc.amount * 1000,
+  });
+});
+
+router.get('/lnurlwithdraw/:id/callback', async function (req, res) {
+  logger.log('/lnurlwithdraw/:id/callback', [req.id, req.params.id]);
+  if (!req.query.k1 || !req.query.pr) return lnurlError(res, 'Missing k1 or invoice');
+
+  let lock = new Lock(redis, 'lnurlw_claim_' + req.params.id);
+  if (!(await lock.obtainLock())) {
+    return lnurlError(res, 'Withdrawal is already being claimed');
+  }
+
+  try {
+    const doc = await getLnurlWithdrawLink(req.params.id);
+    const validationError = validateLnurlWithdrawLink(doc);
+    if (validationError) {
+      await lock.releaseLock();
+      return lnurlError(res, validationError);
+    }
+    if (doc.k1 !== req.query.k1) {
+      await lock.releaseLock();
+      return lnurlError(res, 'Invalid k1');
+    }
+
+    return decodeLnurlWithdrawInvoice(req.query.pr, async function (err, info) {
+      if (err) {
+        await lock.releaseLock();
+        return lnurlError(res, 'Invalid invoice');
+      }
+
+      if (+info.num_satoshis !== +doc.amount) {
+        await lock.releaseLock();
+        return lnurlError(res, 'Invoice amount must match withdrawal amount');
+      }
+
+      const owner = new User(redis, bitcoinclient, lightning);
+      owner._userid = doc.userid;
+
+      if (identity_pubkey === info.destination) {
+        return claimInternalLnurlWithdraw(owner, doc, req.query.pr, info, lock, res);
+      }
+
+      return claimExternalLnurlWithdraw(owner, doc, req.query.pr, info, lock, res);
+    });
+  } catch (err) {
+    await lock.releaseLock();
+    logger.log('/lnurlwithdraw/:id/callback', [req.id, 'error:', err.message]);
+    return lnurlError(res, 'Unable to claim withdrawal');
+  }
+});
+
+router.post('/lnurlwithdraw/:id/cancel', postLimiter, async function (req, res) {
+  logger.log('/lnurlwithdraw/:id/cancel', [req.id, req.params.id]);
+  let u = new User(redis, bitcoinclient, lightning);
+  if (!(await u.loadByAuthorization(req.headers.authorization))) {
+    return errorBadAuth(res);
+  }
+
+  let lock = new Lock(redis, 'lnurlw_claim_' + req.params.id);
+  if (!(await lock.obtainLock())) {
+    return errorGeneralServerError(res);
+  }
+
+  const doc = await u.getLnurlWithdrawLink(req.params.id);
+  if (!doc || doc.userid !== u.getUserId()) {
+    await lock.releaseLock();
+    return errorBadArguments(res);
+  }
+  if (doc.status !== 'active') {
+    await lock.releaseLock();
+    return errorBadArguments(res);
+  }
+
+  doc.status = 'canceled';
+  doc.canceled_at = Math.floor(+new Date() / 1000);
+  await u.updateLnurlWithdrawLink(doc);
+  await u.clearBalanceCache();
+  await lock.releaseLock();
+
+  res.send(formatLnurlWithdrawResponse(req, doc, lnurlWithdrawUrl(req, doc.id)));
+});
+
 router.get('/getbtc', async function (req, res) {
   logger.log('/getbtc', [req.id]);
   let u = new User(redis, bitcoinclient, lightning);
@@ -529,6 +701,178 @@ router.get('/getchaninfo/:chanid', async function (req, res) {
   }
   res.send('');
 });
+
+function lnurlWithdrawUrl(req, id) {
+  if (config.baseUrl) return config.baseUrl.replace(/\/$/, '') + '/lnurlwithdraw/' + id;
+  const host = process.env.TOR_URL || req.headers.host;
+  return req.protocol + '://' + host + '/lnurlwithdraw/' + id;
+}
+
+function encodeLnurl(url) {
+  return bech32.encode('lnurl', bech32.toWords(Buffer.from(url, 'utf8')), 1023).toUpperCase();
+}
+
+function formatLnurlWithdrawResponse(req, doc, url) {
+  return {
+    id: doc.id,
+    status: doc.status,
+    amount: doc.amount,
+    memo: doc.memo,
+    created_at: doc.created_at,
+    expires_at: doc.expires_at,
+    url,
+    lnurl: encodeLnurl(url),
+  };
+}
+
+async function getLnurlWithdrawLink(id) {
+  const u = new User(redis, bitcoinclient, lightning);
+  return u.getLnurlWithdrawLink(id);
+}
+
+function validateLnurlWithdrawLink(doc) {
+  if (!doc) return 'Withdrawal link not found';
+  if (doc.status !== 'active') return 'Withdrawal link is ' + doc.status;
+  if (doc.expires_at <= Math.floor(+new Date() / 1000)) return 'Withdrawal link has expired';
+  return false;
+}
+
+function wantsHtml(req) {
+  return req.headers.accept && req.headers.accept.indexOf('text/html') !== -1;
+}
+
+function renderLnurlWithdrawPage(req, doc, url, error) {
+  const escapedMemo = escapeHtml((doc && doc.memo) || 'LNDHub withdrawal');
+  const amount = doc && doc.amount ? doc.amount : 0;
+  const expiresAt = doc && doc.expires_at ? new Date(doc.expires_at * 1000).toISOString() : '';
+  const lnurl = !error ? encodeLnurl(url) : '';
+  const qrSvg = !error ? qr.imageSync(lnurl, { type: 'svg' }).toString('utf8') : '';
+  const deeplink = !error ? 'lightning:' + lnurl : '';
+  const body = error
+    ? '<p class="error">' + escapeHtml(error) + '</p>'
+    : '<p>Scan this with an LNURL-compatible wallet to withdraw <strong>' +
+      amount +
+      ' sats</strong>.</p><div class="qr">' +
+      qrSvg +
+      '</div><p><a class="button" href="' +
+      deeplink +
+      '">Open in wallet</a></p><p class="muted">Expires ' +
+      expiresAt +
+      '</p>';
+
+  return (
+    '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>' +
+    escapedMemo +
+    '</title><style>body{background:#111;color:#eee;font:16px sans-serif;margin:0;padding:32px;text-align:center}.card{max-width:480px;margin:auto}.qr svg{background:#fff;border-radius:8px;max-width:320px;width:100%;height:auto;padding:12px}.button{background:#1f8feb;border-radius:4px;color:#fff;display:inline-block;padding:10px 16px;text-decoration:none}.muted{color:#999}.error{color:#ff6b6b}</style></head><body><main class="card"><h1>' +
+    escapedMemo +
+    '</h1>' +
+    body +
+    '</main></body></html>'
+  );
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function lnurlError(res, reason) {
+  return res.send({ status: 'ERROR', reason });
+}
+
+function decodeLnurlWithdrawInvoice(payReq, callback) {
+  lightning.decodePayReq({ pay_req: payReq }, callback);
+}
+
+async function claimInternalLnurlWithdraw(owner, doc, payReq, info, lock, res) {
+  let useridPayee = await owner.getUseridByPaymentHash(info.payment_hash);
+  if (!useridPayee) {
+    await lock.releaseLock();
+    return lnurlError(res, 'Internal invoice recipient not found');
+  }
+
+  if (await owner.getPaymentHashPaid(info.payment_hash)) {
+    await lock.releaseLock();
+    return lnurlError(res, 'Invoice was already paid');
+  }
+
+  let UserPayee = new User(redis, bitcoinclient, lightning);
+  UserPayee._userid = useridPayee;
+  await UserPayee.clearBalanceCache();
+  await owner.clearBalanceCache();
+  await owner.savePaidLndInvoice({
+    timestamp: parseInt(+new Date() / 1000),
+    type: 'paid_invoice',
+    value: +info.num_satoshis + Math.floor(info.num_satoshis * internalFee),
+    fee: Math.floor(info.num_satoshis * internalFee),
+    memo: decodeURIComponent(info.description),
+    pay_req: payReq,
+  });
+
+  const invoice = new Invo(redis, bitcoinclient, lightning);
+  invoice.setInvoice(payReq);
+  await invoice.markAsPaidInDatabase();
+
+  const preimage = await invoice.getPreimage();
+  if (preimage) {
+    subscribeInvoicesCallCallback({
+      state: 'SETTLED',
+      memo: info.description,
+      r_preimage: Buffer.from(preimage, 'hex'),
+      r_hash: Buffer.from(info.payment_hash, 'hex'),
+      amt_paid_sat: +info.num_satoshis,
+    });
+  }
+
+  doc.status = 'claimed';
+  doc.claimed_at = Math.floor(+new Date() / 1000);
+  doc.claimed_payment_hash = info.payment_hash;
+  await owner.updateLnurlWithdrawLink(doc);
+  await owner.clearBalanceCache();
+  await lock.releaseLock();
+  return res.send({ status: 'OK' });
+}
+
+async function claimExternalLnurlWithdraw(owner, doc, payReq, info, lock, res) {
+  var call = lightning.sendPayment();
+  let completed = false;
+
+  call.on('data', async function (payment) {
+    if (completed) return;
+    completed = true;
+    let PaymentShallow = new Paym(false, false, false);
+    payment = PaymentShallow.processSendPaymentResponse(payment);
+    payment.pay_req = payReq;
+    payment.decoded = info;
+
+    if (payment && payment.payment_route && payment.payment_route.total_amt_msat) {
+      await owner.savePaidLndInvoice(payment);
+      doc.status = 'claimed';
+      doc.claimed_at = Math.floor(+new Date() / 1000);
+      doc.claimed_payment_hash = info.payment_hash;
+      await owner.updateLnurlWithdrawLink(doc);
+      await owner.clearBalanceCache();
+      await lock.releaseLock();
+      return res.send({ status: 'OK' });
+    }
+
+    await lock.releaseLock();
+    return lnurlError(res, 'Payment failed');
+  });
+
+  call.on('error', async function () {
+    if (completed) return;
+    completed = true;
+    await lock.releaseLock();
+    return lnurlError(res, 'Payment failed');
+  });
+
+  call.write({
+    payment_request: payReq,
+    amt: info.num_satoshis,
+    fee_limit: { fixed: Math.floor(info.num_satoshis * forwardFee) + 1 },
+  });
+}
 
 module.exports = router;
 
